@@ -29,7 +29,7 @@ export default function WordDisplay({ word }) {
       
       <div 
         className="text-5xl md:text-6xl lg:text-7xl whitespace-nowrap"
-        style={{ fontFamily: "'JetBrains Mono', monospace", transform: `translateX(${offset}ch)`, letterSpacing: '0.05em' }}
+        style={{ fontFamily: "'Lexend', sans-serif", transform: `translateX(${offset * 0.4}ch)`, letterSpacing: '0.04em', fontWeight: 400 }}
       >
         <span className="text-white">{before}</span>
         <span className="text-red-500 font-bold">{focal}</span>
