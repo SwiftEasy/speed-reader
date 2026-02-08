@@ -1,5 +1,9 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Play, Pause, SkipBack, SkipForward, Upload, Settings, BookOpen, Zap, List, X } from 'lucide-react';
+import { calculateWordDelay, SAMPLE_TEXT } from '../utils/timing';
+import { readEpub, readPdf, processText } from '../utils/fileParser';
+import WordDisplay from './WordDisplay';
+import ProgressBar from './ProgressBar';
 
 // CSS for spotlight sweep animation
 const spotlightStyles = `
@@ -11,161 +15,6 @@ const spotlightStyles = `
   animation: sweepLine var(--sweep-duration, 2s) linear forwards;
 }
 `;
-
-const SAMPLE_TEXT = `The art of reading is not merely about speed. It is about rhythm, comprehension, and the natural flow of language through your mind.
-
-When you read silently, your brain processes words at varying speeds. Short function words like "the" and "is" fly past almost invisibly, while longer, more complex words demand additional processing time. Your internal voice naturally pauses at the boundaries between clauses, however brief those pauses may be.
-
-This speed reader models that natural rhythm. Instead of displaying every word at the same mechanical pace, it accelerates through familiar words and decelerates for complexity. It pauses at punctuation, breathes between paragraphs, and prepares you for what comes next.
-
-Try adjusting the speed with the up and down arrow keys. Press B for the backglance view, C for context mode, or P for the full page view. Each mode offers a different way to experience accelerated reading while maintaining comprehension.
-
-The goal is not just to read faster. It is to read naturally, at whatever pace feels comfortable, while training your brain to process text more efficiently over time.`;
-
-// Natural reading voice: words the brain barely registers (glide fast)
-const FUNCTION_WORDS = new Set([
-  'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-  'have', 'has', 'had', 'do', 'does', 'did',
-  'of', 'to', 'in', 'at', 'by', 'for', 'with', 'on', 'from', 'into',
-  'it', 'its', 'he', 'she', 'we', 'they', 'me', 'him', 'us', 'them',
-  'my', 'his', 'her', 'our', 'your', 'their',
-  'this', 'that', 'these', 'those',
-  'as', 'if', 'than', 'then', 'not', 'no',
-  'up', 'out', 'about', 'just', 'also', 'very', 'too', 'so',
-  'can', 'could', 'will', 'would', 'shall', 'should', 'may', 'might', 'must',
-  'am', 'get', 'got', 'much', 'many', 'some', 'any',
-  'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other',
-  'own', 'same', 'such'
-]);
-
-// Words where the brain naturally pauses — clause/phrase boundaries
-const PHRASE_BOUNDARY_WORDS = new Set([
-  'which', 'who', 'whom', 'whose', 'where', 'when', 'while',
-  'because', 'although', 'though', 'since', 'unless', 'until',
-  'however', 'therefore', 'moreover', 'furthermore', 'nevertheless',
-  'meanwhile', 'otherwise', 'consequently', 'accordingly',
-  'but', 'yet', 'and', 'or', 'nor',
-  'after', 'before', 'during', 'between', 'through', 'against',
-  'whether', 'whereas', 'whereby'
-]);
-
-function detectChapters(text, pdfOutline = null) {
-  if (pdfOutline && pdfOutline.length > 0) {
-    return pdfOutline;
-  }
-  
-  const chapters = [];
-  const lines = text.split(/\n+/);
-  let wordIndex = 0;
-  
-  const chapterPatterns = [
-    { pattern: /^Chapter\s+(\d+|[IVXLC]+)\s*[:.\-–—]\s*.+/i, level: 1 },
-    { pattern: /^Part\s+(\d+|[IVXLC]+)\s*[:.\-–—]\s*.+/i, level: 0 },
-    { pattern: /^Book\s+(\d+|[IVXLC]+)\s*[:.\-–—]?\s*/i, level: 0 },
-    { pattern: /^Appendix\s+[A-Z]\s*[:.\-–—]/i, level: 1 },
-    { pattern: /^(Introduction|Conclusion|Preface|Foreword|Prologue|Epilogue)$/i, level: 1 },
-  ];
-  
-  const seen = new Set();
-  
-  for (const line of lines) {
-    const trimmed = line.trim();
-    const wordsInLine = trimmed.split(/\s+/).filter(w => w.length > 0);
-    
-    if (trimmed.length >= 5 && trimmed.length <= 80 && wordsInLine.length <= 12) {
-      for (const { pattern, level } of chapterPatterns) {
-        if (pattern.test(trimmed)) {
-          const key = trimmed.toLowerCase().slice(0, 25);
-          if (!seen.has(key)) {
-            seen.add(key);
-            chapters.push({
-              title: trimmed.slice(0, 50) + (trimmed.length > 50 ? '...' : ''),
-              wordIndex: wordIndex,
-              level: level
-            });
-          }
-          break;
-        }
-      }
-    }
-    
-    wordIndex += wordsInLine.length;
-  }
-  
-  chapters.sort((a, b) => a.wordIndex - b.wordIndex);
-  
-  return chapters;
-}
-
-function getOptimalRecognitionPoint(word) {
-  const cleanWord = word.replace(/[^a-zA-Z0-9'-]/g, '');
-  const len = cleanWord.length;
-  if (len <= 1) return 0;
-  if (len <= 5) return Math.floor(len / 2);
-  if (len <= 9) return Math.floor(len / 2) - 1;
-  if (len <= 13) return Math.floor(len / 2) - 1;
-  return Math.floor(len / 2) - 2;
-}
-
-function WordDisplay({ word }) {
-  if (!word) {
-    return (
-      <div className="flex items-center justify-center h-32">
-        <span className="text-zinc-600 text-2xl">Upload a book to start</span>
-      </div>
-    );
-  }
-
-  const cleanWord = word.replace(/[^a-zA-Z0-9'-]/g, '');
-  const orpIndex = getOptimalRecognitionPoint(word);
-  
-  const wordStart = word.indexOf(cleanWord);
-  const actualOrpIndex = wordStart + orpIndex;
-  const before = word.slice(0, actualOrpIndex);
-  const focal = word[actualOrpIndex] || '';
-  const after = word.slice(actualOrpIndex + 1);
-
-  const beforeLen = before.length;
-  const afterLen = after.length;
-  const offset = (afterLen - beforeLen) * 0.5;
-  
-  return (
-    <div className="flex items-center justify-center h-32 relative">
-      <div className="absolute left-1/2 top-0 bottom-0 w-0.5 bg-red-500/30 -translate-x-1/2" />
-      <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 border-2 border-red-500/50 rotate-45" />
-      
-      <div 
-        className="text-5xl md:text-6xl lg:text-7xl whitespace-nowrap"
-        style={{ fontFamily: "'JetBrains Mono', monospace", transform: `translateX(${offset}ch)`, letterSpacing: '0.05em' }}
-      >
-        <span className="text-white">{before}</span>
-        <span className="text-red-500 font-bold">{focal}</span>
-        <span className="text-white">{after}</span>
-      </div>
-    </div>
-  );
-}
-
-function ProgressBar({ current, total, onSeek }) {
-  const percentage = total > 0 ? (current / total) * 100 : 0;
-  
-  return (
-    <div 
-      className="w-full h-2 bg-zinc-800 rounded-full cursor-pointer overflow-hidden"
-      onClick={(e) => {
-        const rect = e.currentTarget.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const newPosition = Math.floor((x / rect.width) * total);
-        onSeek(newPosition);
-      }}
-    >
-      <div 
-        className="h-full bg-gradient-to-r from-red-600 to-red-400 transition-all duration-100"
-        style={{ width: `${percentage}%` }}
-      />
-    </div>
-  );
-}
 
 export default function SpeedReader() {
   const [words, setWords] = useState([]);
@@ -250,106 +99,10 @@ export default function SpeedReader() {
   }, [words.length, isPlaying, currentIndex]);
 
   const calculateDelay = useCallback((word, isContextMode = false, speedMult = 1, chunk = 1, wordPosition = 0, isFirstOfSentence = false, isAfterComma = false, wordsIntoSentence = 0, nextWord = '') => {
-    const baseDelay = 60000 / wpm;
-    
-    // Context mode: simpler timing, still with natural punctuation pauses
-    if (isContextMode) {
-      let delay = baseDelay / speedMult;
-      if (chunk > 1) delay *= (1 + (chunk - 1) * 0.3);
-      if (/[.!?]$/.test(word)) delay *= 1.8;
-      if (/[,;:]$/.test(word)) delay *= 1.3;
-      return delay;
-    }
-    
-    // === NATURAL INTERNAL READING VOICE ===
-    // Models how the brain actually processes text:
-    // - Function words are near-invisible (glide fast)
-    // - Content words get dwell time proportional to complexity
-    // - Phrase boundaries create natural pauses
-    // - Lookahead prepares for upcoming complexity
-    // - Variation follows breathing rhythm, not random noise
-    
-    const cleanWord = word.toLowerCase().replace(/[^a-z'-]/g, '');
-    const isFunctionWord = FUNCTION_WORDS.has(cleanWord);
-    const isPhraseBoundary = PHRASE_BOUNDARY_WORDS.has(cleanWord);
-    
-    let multiplier = 1.0;
-    
-    // --- 1. Word class: function words fly, content words dwell ---
-    if (isFunctionWord && cleanWord.length <= 3) {
-      multiplier = 0.6;  // "the", "a", "is", "of" — brain auto-fills
-    } else if (isFunctionWord) {
-      multiplier = 0.75; // "would", "could", "their" — slightly more weight
-    } else if (cleanWord.length >= 8) {
-      multiplier = 1.15 + (cleanWord.length - 8) * 0.04; // complexity scales with length
-    }
-    
-    // --- 2. Phrase boundaries: natural breath points ---
-    // The brain pauses at clause starters — "however", "because", "which"
-    if (isPhraseBoundary && !isFirstOfSentence) {
-      multiplier *= 1.25;
-    }
-    
-    // --- 3. Lookahead: prepare for what's coming ---
-    if (nextWord) {
-      const nextClean = nextWord.toLowerCase().replace(/[^a-z'-]/g, '');
-      // Slow before a phrase boundary word (anticipatory pause)
-      if (PHRASE_BOUNDARY_WORDS.has(nextClean)) {
-        multiplier *= 1.1;
-      }
-      // Slow before a long/complex upcoming word
-      if (nextClean.length >= 10) {
-        multiplier *= 1.08;
-      }
-    }
-    
-    // --- 4. Sentence position: orient → cruise → fatigue ---
-    if (isFirstOfSentence) {
-      multiplier *= 1.2; // orient: where are we?
-    } else if (isAfterComma) {
-      multiplier *= 1.12; // new clause needs reorientation
-    }
-    // Mid-sentence cruise: brain is locked in, go faster
-    if (wordsIntoSentence >= 2 && wordsIntoSentence <= 5 && !isFunctionWord) {
-      multiplier *= 0.95;
-    }
-    // Long sentence fatigue: gradual deceleration
-    if (wordsIntoSentence > 12) {
-      multiplier *= 1 + (wordsIntoSentence - 12) * 0.01;
-    }
-    
-    // --- 5. Punctuation: mental breath points ---
-    if (/[.!?]$/.test(word)) {
-      multiplier += 0.85; // sentence end — mental breath
-    } else if (/[,;:]$/.test(word)) {
-      multiplier += 0.3;  // clause pause
-    } else if (/[—–\-]$/.test(word)) {
-      multiplier += 0.4;  // dash — thought pivot
-    }
-    
-    // --- 6. Emphasis markers ---
-    if (!isFirstOfSentence && /^[A-Z]/.test(word)) {
-      multiplier *= 1.15; // proper noun or emphasis
-    }
-    if (/\d/.test(word)) multiplier += 0.35; // numbers need decoding
-    if (/^\d+$/.test(word)) multiplier += 0.15;
-    if (/^["'"'(]/.test(word)) multiplier *= 1.1; // quote = voice shift
-    
-    // --- 7. Natural variation: breathing wave + micro-texture ---
-    // Smooth sine wave mimics reading breath rhythm
-    // Micro-variation adds organic texture without robotic randomness
-    const breathWave = Math.sin(wordPosition * 0.4) * 0.05; // ±5% slow wave
-    const microVariation = (Math.random() - 0.5) * 0.06;    // ±3% texture
-    multiplier *= (1 + breathWave + microVariation);
-    
-    // --- Apply ---
-    let delay = baseDelay * multiplier;
-    
-    if (chunk > 1) {
-      delay *= (1 + (chunk - 1) * 0.3);
-    }
-    
-    return delay;
+    return calculateWordDelay(word, wpm, {
+      isContextMode, speedMult, chunk, wordPosition,
+      isFirstOfSentence, isAfterComma, wordsIntoSentence, nextWord
+    });
   }, [wpm]);
 
   useEffect(() => {
@@ -456,146 +209,11 @@ export default function SpeedReader() {
       text = 'Error reading file. Please try a .txt file.';
     }
 
-    const cleanedText = text
-      .replace(/([a-z])([A-Z])/g, '$1 $2')
-      .replace(/([.!?])([A-Z])/g, '$1 $2')
-      .replace(/(\d)([A-Z])/g, '$1 $2')
-      .replace(/([a-z])(\d)/g, '$1 $2')
-      .replace(/([.!?,;:])([a-zA-Z])/g, '$1 $2')
-      .replace(/([a-z]{2,})([A-Z][a-z])/g, '$1 $2')
-      .replace(/([a-z])([A-Z])/g, '$1 $2')
-      .replace(/([''])([a-zA-Z])/g, '$1 $2')
-      .replace(/([a-zA-Z])([''])/g, '$1 $2');
-    
-    const splitLongWords = (word) => {
-      if (word.length <= 15) return [word];
-      let result = word
-        .replace(/([a-z])([A-Z])/g, '$1 $2')
-        .replace(/([.!?,;:])([a-zA-Z])/g, '$1 $2')
-        .replace(/([a-z]{3,})([A-Z])/g, '$1 $2')
-        .replace(/(\.)(\d)/g, '$1 $2')
-        .replace(/(\d)([a-zA-Z])/g, '$1 $2')
-        .replace(/(the)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(the)/gi, '$1 $2')
-        .replace(/(and)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(and)/gi, '$1 $2')
-        .replace(/(of)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(of)/gi, '$1 $2')
-        .replace(/(to)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(to)/gi, '$1 $2')
-        .replace(/(in)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(in)/gi, '$1 $2')
-        .replace(/(was)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(was)/gi, '$1 $2')
-        .replace(/(that)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(that)/gi, '$1 $2')
-        .replace(/(with)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(with)/gi, '$1 $2')
-        .replace(/(for)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(for)/gi, '$1 $2')
-        .replace(/(by)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(by)/gi, '$1 $2')
-        .replace(/(be)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(be)/gi, '$1 $2')
-        .replace(/(had)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(had)/gi, '$1 $2')
-        .replace(/(his)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(his)/gi, '$1 $2')
-        .replace(/(not)([a-z])/gi, '$1 $2')
-        .replace(/([a-z])(not)/gi, '$1 $2');
-      const parts = result.split(/\s+/).filter(w => w.length > 0);
-      return parts.length > 1 ? parts : [word];
-    };
-    
-    const isFootnoteOrPageNumber = (w) => {
-      if (/^\.?\d{1,3}$/.test(w)) return true;
-      if (/^\[\d+\]$/.test(w)) return true;
-      if (/^\(\d+\)$/.test(w)) return true;
-      if (/^\d+\.$/.test(w) && parseInt(w) < 500) return true;
-      return false;
-    };
-    
-    const paragraphs = cleanedText.split(/\n\n+/);
-    const paraStarts = new Set();
-    let wordIdx = 0;
-    
-    const wordList = [];
-    for (const para of paragraphs) {
-      const paraWords = para
-        .replace(/\s+/g, ' ')
-        .trim()
-        .split(' ')
-        .filter(w => w.length > 0)
-        .flatMap(splitLongWords)
-        .filter(w => !isFootnoteOrPageNumber(w));
-      
-      if (paraWords.length > 0) {
-        paraStarts.add(wordIdx);
-        wordList.push(...paraWords);
-        wordIdx += paraWords.length;
-      }
-    }
+    const { words: wordList, paragraphStarts: paraStarts, chapters: adjustedChapters } = processText(text, pdfOutline);
     
     setParagraphStarts(paraStarts);
-
-    if (wordList.length === 0) {
-      setWords(['No', 'text', 'found', 'in', 'file.', 'Try', 'a', 'different', 'file.']);
-    } else {
-      setWords(wordList);
-    }
-    
+    setWords(wordList);
     setRawText(text);
-    
-    const detectedChapters = detectChapters(text, pdfOutline);
-    
-    const findChapterInWordList = (title, estimatedIdx) => {
-      const romanMatch = title.match(/^([IVXLC]+)\s*[:\-–—.]?\s*(.+)$/i);
-      if (romanMatch) {
-        const [, roman, restTitle] = romanMatch;
-        const firstTitleWord = restTitle.split(/\s+/).filter(w => w.length > 1)[0]?.toLowerCase().replace(/[^a-z]/g, '');
-        if (firstTitleWord) {
-          const searchStart = Math.max(0, estimatedIdx - 500);
-          const searchEnd = Math.min(wordList.length, estimatedIdx + 1500);
-          for (let i = searchStart; i < searchEnd; i++) {
-            const word = wordList[i]?.replace(/[^a-zA-Z]/g, '');
-            if (word?.toUpperCase() === roman.toUpperCase()) {
-              for (let k = 1; k <= 10; k++) {
-                const nextWord = wordList[i + k]?.toLowerCase().replace(/[^a-z]/g, '');
-                if (nextWord === firstTitleWord) {
-                  return i;
-                }
-              }
-            }
-          }
-        }
-      }
-      
-      const titleWords = title.split(/\s+/).filter(w => w.length > 1);
-      const searchStart = Math.max(0, estimatedIdx - 500);
-      const searchEnd = Math.min(wordList.length, estimatedIdx + 1500);
-      for (let i = searchStart; i < searchEnd; i++) {
-        let matchCount = 0;
-        for (let j = 0; j < Math.min(titleWords.length, 4); j++) {
-          const tw = titleWords[j]?.toLowerCase().replace(/[^a-z0-9]/g, '');
-          const ww = wordList[i + j]?.toLowerCase().replace(/[^a-z0-9]/g, '');
-          if (tw === ww) matchCount++;
-        }
-        if (matchCount >= Math.min(titleWords.length, 4) * 0.6) {
-          return i;
-        }
-      }
-      return estimatedIdx;
-    };
-    
-    const ratio = wordList.length / Math.max(1, text.split(/\s+/).length);
-    const adjustedChapters = detectedChapters.map(ch => {
-      const estimated = Math.floor(ch.wordIndex * ratio);
-      const found = findChapterInWordList(ch.title, estimated);
-      console.log(`${found !== estimated ? '✓' : '○'} "${ch.title.slice(0,25)}" est:${estimated} → ${found}`);
-      return { ...ch, wordIndex: found };
-    }).sort((a, b) => a.wordIndex - b.wordIndex);
-    
-    console.log(`Found ${adjustedChapters.length} chapters`);
     setChapters(adjustedChapters);
     
     const bookKey = `speedreader_${file.name}`;
@@ -604,7 +222,6 @@ export default function SpeedReader() {
       const { index, wpm: savedWpm } = JSON.parse(savedProgress);
       if (index > 0 && index < wordList.length) {
         setCurrentIndex(index);
-        console.log(`Resumed from word ${index}`);
       }
       if (savedWpm) setWpm(savedWpm);
     } else {
@@ -629,7 +246,6 @@ export default function SpeedReader() {
         setCurrentIndex(i);
         setShowChapters(false);
         setIsPlaying(false);
-        console.log(`Jumped to "${chapter.title}" at word ${i}`);
         return;
       }
     }
@@ -637,181 +253,6 @@ export default function SpeedReader() {
     setCurrentIndex(Math.min(chapter.wordIndex, words.length - 1));
     setShowChapters(false);
     setIsPlaying(false);
-    console.log(`Fallback jump to word ${chapter.wordIndex}`);
-  };
-
-  const readEpub = async (file) => {
-    try {
-      const arrayBuffer = await file.arrayBuffer();
-      const JSZip = (await import('jszip')).default;
-      const zip = await JSZip.loadAsync(arrayBuffer);
-      
-      let text = '';
-      const htmlFiles = Object.keys(zip.files).filter(name => 
-        name.endsWith('.html') || name.endsWith('.xhtml')
-      );
-      
-      for (const fileName of htmlFiles) {
-        const content = await zip.files[fileName].async('string');
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(content, 'text/html');
-        text += doc.body?.textContent || '';
-        text += ' ';
-      }
-      
-      return text;
-    } catch (err) {
-      console.error('EPUB parsing error:', err);
-      return 'Error reading EPUB file. Try a .txt file instead.';
-    }
-  };
-
-  const readPdf = async (file) => {
-    try {
-      const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.js');
-      pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
-      
-      const arrayBuffer = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      
-      let text = '';
-      const totalPages = pdf.numPages;
-      const pageWordCounts = [0];
-      console.log(`Processing ${totalPages} pages...`);
-      
-      for (let i = 1; i <= totalPages; i++) {
-        const page = await pdf.getPage(i);
-        const content = await page.getTextContent();
-        
-        let lastY = null;
-        let lastX = null;
-        let lastWidth = 0;
-        let pageText = '';
-        
-        for (const item of content.items) {
-          const x = item.transform[4];
-          const y = item.transform[5];
-          const fontSize = Math.abs(item.transform[0]) || 12;
-          const width = item.width || (item.str.length * fontSize * 0.5);
-          
-          if (lastY !== null) {
-            const yGap = Math.abs(y - lastY);
-            if (yGap > fontSize * 1.5) {
-              pageText += '\n\n';
-              lastX = null;
-            } else if (yGap > 5) {
-              pageText += ' ';
-              lastX = null;
-            }
-          }
-          if (lastX !== null) {
-            const gap = x - (lastX + lastWidth);
-            const spaceThreshold = fontSize * 0.15;
-            if (gap > spaceThreshold || gap < -1) {
-              pageText += ' ';
-            }
-          }
-          
-          pageText += item.str;
-          lastX = x;
-          lastY = y;
-          lastWidth = width;
-        }
-        text += pageText + '\n\n';
-        pageWordCounts.push(text.split(/\s+/).filter(w => w).length);
-      }
-      
-      let pdfOutline = [];
-      const allWords = text.split(/\s+/).filter(w => w);
-      
-      const findTitleInText = (title, startWordIdx) => {
-        const searchEnd = Math.min(allWords.length, startWordIdx + 3000);
-        
-        const romanMatch = title.match(/^([IVXLC]+)\s*[:\-–—.]?\s*(.+)$/i);
-        if (romanMatch) {
-          const [, roman, restTitle] = romanMatch;
-          const restWords = restTitle.split(/\s+/).filter(w => w.length > 1);
-          const firstTitleWord = restWords[0]?.toLowerCase().replace(/[^a-z]/g, '');
-          
-          if (firstTitleWord) {
-            for (let i = startWordIdx; i < searchEnd; i++) {
-              const word = allWords[i]?.replace(/[^a-zA-Z]/g, '');
-              if (word?.toUpperCase() === roman.toUpperCase()) {
-                for (let k = 1; k <= 10; k++) {
-                  const nextWord = allWords[i + k]?.toLowerCase().replace(/[^a-z]/g, '');
-                  if (nextWord === firstTitleWord) {
-                    return i;
-                  }
-                }
-              }
-            }
-          }
-        }
-        
-        const titleWords = title.split(/\s+/).filter(w => w.length > 1);
-        if (titleWords.length === 0) return startWordIdx;
-        
-        for (let i = startWordIdx; i < searchEnd - titleWords.length; i++) {
-          let matchCount = 0;
-          for (let j = 0; j < Math.min(titleWords.length, 5); j++) {
-            const tw = titleWords[j].toLowerCase().replace(/[^a-z0-9]/g, '');
-            const aw = allWords[i + j]?.toLowerCase().replace(/[^a-z0-9]/g, '');
-            if (tw === aw || (tw.length > 3 && aw?.includes(tw))) {
-              matchCount++;
-            }
-          }
-          if (matchCount >= Math.min(titleWords.length, 5) * 0.6) {
-            return i;
-          }
-        }
-        return startWordIdx;
-      };
-      
-      try {
-        const outline = await pdf.getOutline();
-        if (outline && outline.length > 0) {
-          const flattenOutline = async (items, level = 0) => {
-            for (const item of items) {
-              let pageNum = 1;
-              if (item.dest) {
-                try {
-                  const dest = typeof item.dest === 'string' 
-                    ? await pdf.getDestination(item.dest) 
-                    : item.dest;
-                  if (dest) {
-                    const pageIndex = await pdf.getPageIndex(dest[0]);
-                    pageNum = pageIndex + 1;
-                  }
-                } catch (e) {}
-              }
-              const pageStartIdx = pageNum <= 1 ? 0 : (pageWordCounts[pageNum - 2] || 0);
-              const exactIdx = findTitleInText(item.title, pageStartIdx);
-              const found = exactIdx !== pageStartIdx;
-              console.log(`${found ? '✓' : '✗'} "${item.title.slice(0,25)}" page ${pageNum} → word ${exactIdx}${found ? '' : ' (fallback)'}`);
-              
-              pdfOutline.push({
-                title: item.title,
-                wordIndex: exactIdx,
-                level: Math.min(level, 2)
-              });
-              if (item.items && item.items.length > 0) {
-                await flattenOutline(item.items, level + 1);
-              }
-            }
-          };
-          await flattenOutline(outline);
-          console.log(`PDF outline: ${pdfOutline.length} entries (with exact positions)`);
-        }
-      } catch (e) {
-        console.log('No PDF outline available');
-      }
-      
-      console.log(`PDF loaded: ${totalPages} pages, ${text.split(/\s+/).length} words`);
-      return { text: text || 'No text found in PDF.', outline: pdfOutline };
-    } catch (err) {
-      console.error('PDF parsing error:', err);
-      return { text: 'PDF reading failed. Error: ' + err.message, outline: [] };
-    }
   };
 
   const togglePlay = () => {
@@ -1241,19 +682,12 @@ export default function SpeedReader() {
             <div className="flex gap-3">
               <button
                 onClick={() => {
-                  const sampleWords = SAMPLE_TEXT.replace(/\s+/g, ' ').trim().split(' ').filter(w => w.length > 0);
-                  const paragraphs = SAMPLE_TEXT.split(/\n\n+/);
-                  const paraStarts = new Set();
-                  let idx = 0;
-                  for (const para of paragraphs) {
-                    const pw = para.replace(/\s+/g, ' ').trim().split(' ').filter(w => w.length > 0);
-                    if (pw.length > 0) { paraStarts.add(idx); idx += pw.length; }
-                  }
+                  const { words: demoWords, paragraphStarts: paraStarts, chapters: demoChapters } = processText(SAMPLE_TEXT);
                   setParagraphStarts(paraStarts);
-                  setWords(sampleWords);
+                  setWords(demoWords);
                   setFileName('demo');
                   setRawText(SAMPLE_TEXT);
-                  setChapters([]);
+                  setChapters(demoChapters);
                   setCurrentIndex(0);
                   setIsPlaying(false);
                 }}
